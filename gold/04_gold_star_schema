@@ -1,0 +1,837 @@
+# =============================================================================
+# NOTEBOOK: 04_gold_star_schema
+# Consolidated from Fabric notebook (.ipynb) into a single .py file for
+# version control in GitHub. Cell boundaries are preserved as comment markers
+# so the notebook structure remains traceable in source control.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# MARKDOWN
+# -----------------------------------------------------------------------------
+# <h1 style="color:#C00000; font-weight:bold; font-family:'EB Garamond', Garamond, serif; letter-spacing:1.5px; border-bottom: 2px solid #C00000; padding-bottom:6px;">04_gold_star_schema</h1>
+
+# =============================================================================
+# CODE CELL 1 (notebook cell index 1)
+# =============================================================================
+# =============================================================================
+# CELL 0 — Header & pipeline overview
+# =============================================================================
+# Notebook: 04_gold_star_schema
+# Purpose : Build the final Gold Star Schema, consumed directly by BI tools.
+#           Pure star schema — every dimension is fully denormalized (no
+#           dimension-to-dimension relationships / no snowflaking).
+#
+# Dimensions (7):
+#   1. gold.dim_date      — generated calendar dimension (2016-2021), not
+#                            sourced from any file. Required for YTD vs LY
+#                            YTD comparisons (business bonus question).
+#   2. gold.dim_customer  — from silver.dim_customer, joined to
+#                            silver.dim_division for the Division attribute
+#                            (denormalized in, not a separate dim).
+#   3. gold.dim_product   — from silver.dim_product, joined to
+#                            silver.dim_category (category flattened in —
+#                            this is what keeps the schema a pure star,
+#                            not a snowflake).
+#   4. gold.dim_employee  — from silver.dim_employee, joined to
+#                            silver.dim_office (office attributes flattened in).
+#   5. gold.dim_supplier  — from silver.dim_supplier, direct conform.
+#   6. gold.dim_shipper   — from silver.dim_shipper, direct conform
+#                            (includes the "Unknown Shipper" placeholder).
+#   7. gold.dim_division  — from silver.dim_division, direct conform
+#                            (kept standalone too, since Division is also
+#                            one of the business dimensions requested
+#                            independently in the case, e.g. "compare by
+#                            Division" without going through Customer).
+#
+# Facts (2):
+#   1. gold.fact_sales    — grain: one row per order line item
+#                            (order_id, line_no). Built by joining
+#                            silver.fact_order_details + silver.fact_orders
+#                            + silver.fact_shipments (shipper_id and
+#                            corrected shipment_date only — Shipments'
+#                            other columns, e.g. its own customer_id/
+#                            employee_id/product_id, are redundant with
+#                            Orders/Order_Details and are NOT used, to
+#                            avoid two sources of truth for the same fact).
+#                            Measures: extended_amount (replaces the
+#                            unusable Orders.TotalOrder) and margin,
+#                            both calculated here — not stored redundantly
+#                            upstream.
+#   2. gold.fact_budget   — from silver.fact_budget, direct conform.
+#
+# Author  : Rafael
+# Date    : 2026-07-15
+# =============================================================================
+
+# =============================================================================
+# CODE CELL 2 (notebook cell index 2)
+# =============================================================================
+# =============================================================================
+# CELL 1 — Imports
+# =============================================================================
+# Self-contained notebook — no %run dependency on other layers' shared
+# functions notebooks. Gold reads from Silver Delta TABLES only.
+
+import uuid
+import traceback
+from datetime import datetime, timezone
+
+from pyspark.sql import functions as F
+from pyspark.sql.functions import (
+    col, lit, when, coalesce, sha2, concat_ws, current_timestamp,
+    date_format, year, quarter, month, dayofmonth, dayofweek, weekofyear
+)
+from pyspark.sql.types import (
+    StringType, StructType, StructField, TimestampType, LongType, DateType
+)
+from delta.tables import DeltaTable
+
+print("Gold imports loaded successfully.")
+
+# =============================================================================
+# CODE CELL 3 (notebook cell index 3)
+# =============================================================================
+# =============================================================================
+# CELL 2 — Configuration & run identity
+# =============================================================================
+
+RUN_ID        = str(uuid.uuid4())
+RUN_TIMESTAMP = datetime.now(timezone.utc)
+
+# dim_date coverage range — matches the confirmed OrderDate range from EDA
+# (2016-04-19 to 2021-03-31), with a little padding on both ends
+DATE_RANGE_START = "2016-01-01"
+DATE_RANGE_END   = "2021-12-31"
+
+print(f"Run ID          : {RUN_ID}")
+print(f"Run timestamp   : {RUN_TIMESTAMP}")
+print(f"Date range      : {DATE_RANGE_START} to {DATE_RANGE_END}")
+
+# =============================================================================
+# CODE CELL 4 (notebook cell index 4)
+# =============================================================================
+# =============================================================================
+# CELL 3 -- Shared functions for this notebook: write_gold_merge(),
+#           validate_gold(), write_audit_log()
+# =============================================================================
+# Same MERGE + hash idempotent pattern as Bronze/Silver, kept local to this
+# notebook since Gold is self-contained (per design decision -- fewer
+# special cases here than Bronze/Silver, doesn't warrant a separate shared
+# functions notebook).
+
+# -----------------------------------------------------------------------------
+# 3.1 -- write_gold_merge()
+# -----------------------------------------------------------------------------
+def write_gold_merge(df_transformed, target_table: str, merge_key):
+    """
+    Write a transformed DataFrame to Gold using MERGE/UPSERT with a
+    SHA-256 row_hash for change detection. Same created_at/updated_at
+    idempotency pattern as Bronze and Silver.
+    """
+    key_cols = [merge_key] if isinstance(merge_key, str) else list(merge_key)
+
+    if "created_at" not in df_transformed.columns:
+        df_transformed = df_transformed.withColumn("created_at", F.current_timestamp())
+    if "updated_at" not in df_transformed.columns:
+        df_transformed = df_transformed.withColumn("updated_at", F.current_timestamp())
+
+    excluded_from_hash = set(key_cols) | {"created_at", "updated_at", "row_hash"}
+    hash_cols = [c for c in df_transformed.columns if c not in excluded_from_hash]
+
+    print(f"Merge key(s) : {key_cols}")
+    print(f"Columns included in row_hash ({len(hash_cols)}): {hash_cols}")
+
+    df_transformed = df_transformed.withColumn(
+        "row_hash",
+        sha2(concat_ws("||", *[coalesce(col(c).cast("string"), lit("")) for c in hash_cols]), 256)
+    )
+
+    table_exists = spark.catalog.tableExists(target_table)
+
+    print(f"{'='*60}")
+    print(f"  MERGE / UPSERT -- {target_table}")
+    print(f"{'='*60}")
+    print(f"  Target table : {target_table}")
+    print(f"  Table exists : {table_exists}")
+    print(f"{'='*60}\n")
+
+    if not table_exists:
+        print("-- First run detected -- performing full INSERT --")
+        df_transformed.write.format("delta").mode("overwrite").saveAsTable(target_table)
+
+        rows_total = spark.table(target_table).count()
+        print(f"  Table created : {target_table}")
+        print(f"  Rows inserted : {rows_total:,}")
+
+        return {"rows_inserted": rows_total, "rows_updated": 0, "rows_total_after_write": rows_total}
+
+    else:
+        print("-- Existing table detected -- performing MERGE --")
+
+        spark.conf.set("spark.databricks.delta.schema.autoMerge.enabled", "true")
+
+        target_columns = [f.name for f in spark.table(target_table).schema.fields]
+        if "row_hash" not in target_columns:
+            print(f"  row_hash column missing on {target_table} -- adding it now")
+            spark.sql(f"ALTER TABLE {target_table} ADD COLUMNS (row_hash STRING)")
+            spark.catalog.refreshTable(target_table)
+
+        delta_table = DeltaTable.forName(spark, target_table)
+
+        merge_condition = " AND ".join([f"target.{k} = source.{k}" for k in key_cols])
+
+        update_cols = {
+            c: f"source.{c}" for c in df_transformed.columns
+            if c not in key_cols and c != "created_at"
+        }
+
+        delta_table.alias("target").merge(
+            df_transformed.alias("source"), merge_condition
+        ).whenMatchedUpdate(
+            condition="target.row_hash != source.row_hash", set=update_cols
+        ).whenNotMatchedInsertAll().execute()
+
+        history = spark.sql(f"DESCRIBE HISTORY {target_table} LIMIT 1").collect()[0]
+        metrics = history["operationMetrics"]
+        rows_inserted = int(metrics.get("numTargetRowsInserted", 0))
+        rows_updated  = int(metrics.get("numTargetRowsUpdated", 0))
+        rows_total    = spark.table(target_table).count()
+
+        print(f"  MERGE complete")
+        print(f"  Rows inserted : {rows_inserted:,}")
+        print(f"  Rows updated  : {rows_updated:,}")
+        print(f"  Total rows in Gold table : {rows_total:,}")
+
+        return {"rows_inserted": rows_inserted, "rows_updated": rows_updated, "rows_total_after_write": rows_total}
+
+
+# -----------------------------------------------------------------------------
+# 3.2 -- validate_gold()
+# -----------------------------------------------------------------------------
+def validate_gold(target_table: str, key_column):
+    """
+    Post-write validation checks on a Gold Delta table. Same structure as
+    validate_bronze()/validate_silver().
+    """
+    key_cols = [key_column] if isinstance(key_column, str) else list(key_column)
+
+    df_gold = spark.table(target_table)
+    total_rows = df_gold.count()
+
+    null_condition = None
+    for k in key_cols:
+        cond = F.col(k).isNull()
+        null_condition = cond if null_condition is None else (null_condition | cond)
+    null_key_count = df_gold.filter(null_condition).count()
+
+    duplicate_keys_df = df_gold.groupBy(*key_cols).count().filter("count > 1")
+    duplicate_keys_count = duplicate_keys_df.count()
+
+    print(f"{'='*60}")
+    print(f"  POST-WRITE VALIDATION -- {target_table}")
+    print(f"{'='*60}")
+    print(f"\n-- Row count --")
+    print(f"  Total rows : {total_rows:,}")
+    print(f"\n-- Key integrity ({', '.join(key_cols)}) --")
+    key_status_msg = "\u2705 No nulls on key" if null_key_count == 0 else "\u274c NULLS FOUND"
+    print(f"  {key_status_msg} ({null_key_count:,})")
+    print(f"\n-- Duplicate check --")
+    if duplicate_keys_count == 0:
+        print(f"  \u2705 No duplicate key values found")
+    else:
+        print(f"  \u26a0\ufe0f  {duplicate_keys_count} duplicate key value(s) found")
+        display(duplicate_keys_df.limit(10))
+    print(f"\n{'='*60}")
+    print(f"  \u2705 Validation complete -- {target_table}")
+    print(f"{'='*60}")
+
+    return {"total_rows": total_rows, "null_key_count": null_key_count, "duplicate_key_count": duplicate_keys_count}
+
+
+# -----------------------------------------------------------------------------
+# 3.3 -- write_audit_log()
+# -----------------------------------------------------------------------------
+AUDIT_TABLE = "governance.audit_ingestion_log"
+
+def write_audit_log(run_id, table_name, source_file_name, run_timestamp,
+                     rows_read, rows_inserted, rows_updated, rows_total,
+                     status, error_message):
+
+    audit_schema = StructType([
+        StructField("run_id",                 StringType(),    False),
+        StructField("table_name",              StringType(),    False),
+        StructField("source_file_name",        StringType(),    True),
+        StructField("run_timestamp",           TimestampType(), False),
+        StructField("rows_read_from_source",   LongType(),      True),
+        StructField("rows_inserted",           LongType(),      True),
+        StructField("rows_updated",            LongType(),      True),
+        StructField("rows_total_after_write",  LongType(),      True),
+        StructField("status",                  StringType(),    False),
+        StructField("error_message",           StringType(),    True),
+    ])
+
+    audit_row = [(run_id, table_name, source_file_name, run_timestamp,
+                  rows_read, rows_inserted, rows_updated, rows_total,
+                  status, error_message)]
+
+    df_audit = spark.createDataFrame(audit_row, schema=audit_schema)
+    df_audit.write.format("delta").mode("append").saveAsTable(AUDIT_TABLE)
+
+    print(f"  \U0001F4DD Audit log written : run_id={run_id} | table={table_name} | status={status}")
+
+# =============================================================================
+# CODE CELL 5 (notebook cell index 5)
+# =============================================================================
+# =============================================================================
+# CELL 4 -- gold.dim_date
+# =============================================================================
+# Purpose : Generate a standard calendar dimension covering DATE_RANGE_START
+#           to DATE_RANGE_END. Not sourced from any file -- required for
+#           YTD vs LY YTD comparisons (business bonus question) and general
+#           time-based drill-down (Year -> Quarter -> Month -> Day).
+# =============================================================================
+
+def build_dim_date():
+    df_dates = spark.sql(f"""
+        SELECT explode(sequence(
+            to_date('{DATE_RANGE_START}'),
+            to_date('{DATE_RANGE_END}'),
+            interval 1 day
+        )) AS full_date
+    """)
+
+    df_dim_date = df_dates.select(
+        date_format(col("full_date"), "yyyyMMdd").cast("int").alias("date_key"),
+        col("full_date"),
+        year(col("full_date")).alias("year"),
+        quarter(col("full_date")).alias("quarter"),
+        month(col("full_date")).alias("month"),
+        date_format(col("full_date"), "MMMM").alias("month_name"),
+        dayofmonth(col("full_date")).alias("day_of_month"),
+        dayofweek(col("full_date")).alias("day_of_week"),
+        date_format(col("full_date"), "EEEE").alias("day_name"),
+        weekofyear(col("full_date")).alias("week_of_year"),
+        # day_of_year used to compare YTD windows consistently (e.g.
+        # "all dates where day_of_year <= today's day_of_year" for
+        # YTD vs LY YTD comparisons)
+        date_format(col("full_date"), "D").cast("int").alias("day_of_year"),
+    )
+
+    print(f"dim_date rows: {df_dim_date.count():,} "
+          f"(covering {DATE_RANGE_START} to {DATE_RANGE_END})")
+
+    return df_dim_date
+
+
+df_dim_date = build_dim_date()
+display(df_dim_date.limit(5))
+
+write_metrics = write_gold_merge(
+    df_transformed=df_dim_date,
+    target_table="gold.dim_date",
+    merge_key="date_key"
+)
+
+validation = validate_gold(target_table="gold.dim_date", key_column="date_key")
+
+write_audit_log(
+    run_id=RUN_ID, table_name="gold.dim_date", source_file_name="generated:build_dim_date",
+    run_timestamp=RUN_TIMESTAMP, rows_read=df_dim_date.count(),
+    rows_inserted=write_metrics["rows_inserted"], rows_updated=write_metrics["rows_updated"],
+    rows_total=write_metrics["rows_total_after_write"], status="SUCCESS", error_message=None
+)
+
+# =============================================================================
+# CODE CELL 6 (notebook cell index 6)
+# =============================================================================
+# =============================================================================
+# CELL 5 -- gold.dim_customer
+# =============================================================================
+# Purpose : Conform silver.dim_customer, denormalizing Division attributes
+#           in directly (pure star schema -- no separate dim-to-dim join
+#           needed at query time for "sales by Division via Customer").
+# =============================================================================
+
+def build_dim_customer():
+    df_cust = spark.table("silver.dim_customer")
+    df_div  = spark.table("silver.dim_division").select(
+        col("division_id"),
+        col("division_name")
+    )
+
+    df_dim_customer = df_cust.join(
+        df_div, on="division_id", how="left"
+    ).select(
+        col("customer_id"),
+        col("company_name"),
+        col("contact_name"),
+        col("city"),
+        col("country"),
+        col("state_province"),
+        col("division_id"),
+        col("division_name"),
+        col("address"),
+        col("phone"),
+        col("fax"),
+        col("postal_code"),
+        col("birth_date"),
+        # Business-facing tables keep audit lean: only Gold's own
+        # created_at/updated_at (added by write_gold_merge) plus a single
+        # source_system reference. Full cross-layer lineage (Bronze/Silver
+        # timestamps, source file names) lives in
+        # governance.audit_ingestion_log, not repeated in every Gold row --
+        # this table is queried directly by business users in Power BI.
+        col("bronze_source_system"),
+    )
+
+    print(f"dim_customer rows: {df_dim_customer.count():,}")
+    return df_dim_customer
+
+
+df_dim_customer = build_dim_customer()
+display(df_dim_customer.limit(5))
+
+write_metrics = write_gold_merge(
+    df_transformed=df_dim_customer,
+    target_table="gold.dim_customer",
+    merge_key="customer_id"
+)
+
+validation = validate_gold(target_table="gold.dim_customer", key_column="customer_id")
+
+write_audit_log(
+    run_id=RUN_ID, table_name="gold.dim_customer", source_file_name="silver.dim_customer+silver.dim_division",
+    run_timestamp=RUN_TIMESTAMP, rows_read=df_dim_customer.count(),
+    rows_inserted=write_metrics["rows_inserted"], rows_updated=write_metrics["rows_updated"],
+    rows_total=write_metrics["rows_total_after_write"], status="SUCCESS", error_message=None
+)
+
+# =============================================================================
+# CODE CELL 7 (notebook cell index 7)
+# =============================================================================
+# =============================================================================
+# CELL 6 -- gold.dim_product
+# =============================================================================
+# Purpose : Conform silver.dim_product, denormalizing Category attributes
+#           in directly -- this is the specific decision that keeps the
+#           schema a pure star, not a snowflake (Category flattened into
+#           Product rather than kept as a separate joined dimension).
+# =============================================================================
+
+def build_dim_product():
+    df_prod = spark.table("silver.dim_product")
+    df_cat  = spark.table("silver.dim_category").select(
+        col("category_id"),
+        col("category_name"),
+        col("description").alias("category_description")
+    )
+
+    df_dim_product = df_prod.join(
+        df_cat, on="category_id", how="left"
+    ).select(
+        col("product_id"),
+        col("product_name"),
+        col("category_id"),
+        col("category_name"),
+        col("category_description"),
+        col("supplier_id"),
+        col("quantity_per_unit"),
+        col("unit_cost"),
+        col("unit_price"),
+        col("units_in_stock"),
+        col("units_on_order"),
+        col("bronze_source_system"),
+    )
+
+    print(f"dim_product rows: {df_dim_product.count():,}")
+    return df_dim_product
+
+
+df_dim_product = build_dim_product()
+display(df_dim_product.limit(5))
+
+write_metrics = write_gold_merge(
+    df_transformed=df_dim_product,
+    target_table="gold.dim_product",
+    merge_key="product_id"
+)
+
+validation = validate_gold(target_table="gold.dim_product", key_column="product_id")
+
+write_audit_log(
+    run_id=RUN_ID, table_name="gold.dim_product", source_file_name="silver.dim_product+silver.dim_category",
+    run_timestamp=RUN_TIMESTAMP, rows_read=df_dim_product.count(),
+    rows_inserted=write_metrics["rows_inserted"], rows_updated=write_metrics["rows_updated"],
+    rows_total=write_metrics["rows_total_after_write"], status="SUCCESS", error_message=None
+)
+
+# =============================================================================
+# CODE CELL 8 (notebook cell index 8)
+# =============================================================================
+# =============================================================================
+# CELL 7 -- gold.dim_employee
+# =============================================================================
+# Purpose : Conform silver.dim_employee, denormalizing Office attributes in
+#           directly. Includes the "Unknown Employee" placeholder (emp_id=-1).
+# =============================================================================
+
+def build_dim_employee():
+    df_emp = spark.table("silver.dim_employee")
+    df_off = spark.table("silver.dim_office").select(
+        col("office"),
+        col("office_city"),
+        col("office_state_province"),
+        col("office_country")
+    )
+
+    df_dim_employee = df_emp.join(
+        df_off, on="office", how="left"
+    ).select(
+        col("emp_id"),
+        col("last_name"),
+        col("first_name"),
+        col("title"),
+        col("hire_date"),
+        col("office"),
+        col("office_city"),
+        col("office_state_province"),
+        col("office_country"),
+        col("reports_to"),
+        col("year_salary"),
+        col("bronze_source_system"),
+    )
+
+    print(f"dim_employee rows: {df_dim_employee.count():,}")
+    return df_dim_employee
+
+
+df_dim_employee = build_dim_employee()
+display(df_dim_employee.limit(5))
+
+write_metrics = write_gold_merge(
+    df_transformed=df_dim_employee,
+    target_table="gold.dim_employee",
+    merge_key="emp_id"
+)
+
+validation = validate_gold(target_table="gold.dim_employee", key_column="emp_id")
+
+write_audit_log(
+    run_id=RUN_ID, table_name="gold.dim_employee", source_file_name="silver.dim_employee+silver.dim_office",
+    run_timestamp=RUN_TIMESTAMP, rows_read=df_dim_employee.count(),
+    rows_inserted=write_metrics["rows_inserted"], rows_updated=write_metrics["rows_updated"],
+    rows_total=write_metrics["rows_total_after_write"], status="SUCCESS", error_message=None
+)
+
+# =============================================================================
+# CODE CELL 9 (notebook cell index 9)
+# =============================================================================
+# =============================================================================
+# CELL 8 -- gold.dim_supplier, gold.dim_shipper, gold.dim_division
+# =============================================================================
+# Purpose : Three simple conformed dimensions -- direct pass-through from
+#           Silver, no joins or business logic needed. Grouped in one cell
+#           since none of them warrant a dedicated build function.
+# =============================================================================
+
+simple_dims = [
+    {"source_table": "silver.dim_supplier", "target_table": "gold.dim_supplier", "key_column": "supplier_id"},
+    {"source_table": "silver.dim_shipper",  "target_table": "gold.dim_shipper",  "key_column": "shipper_id"},
+    {"source_table": "silver.dim_division", "target_table": "gold.dim_division", "key_column": "division_id"},
+]
+
+for dim in simple_dims:
+    print(f"\n{'#'*70}")
+    print(f"# BUILDING: {dim['target_table']}")
+    print(f"{'#'*70}")
+
+    df = spark.table(dim["source_table"])
+
+    # Business-facing tables keep audit lean: drop Silver's created_at/
+    # updated_at/row_hash and bronze_source_file_name entirely -- Gold
+    # generates its own fresh created_at/updated_at (via write_gold_merge),
+    # and full cross-layer lineage lives in governance.audit_ingestion_log,
+    # not repeated in every Gold row (this table is queried directly by
+    # business users in Power BI). Only source_system is kept, as a light
+    # reference in case multiple source systems exist in the future.
+    cols_to_drop = ["created_at", "updated_at", "row_hash", "bronze_source_file_name"]
+    df = df.drop(*[c for c in cols_to_drop if c in df.columns])
+
+    print(f"{dim['target_table']} rows: {df.count():,}")
+    display(df.limit(5))
+
+    write_metrics = write_gold_merge(
+        df_transformed=df,
+        target_table=dim["target_table"],
+        merge_key=dim["key_column"]
+    )
+
+    validation = validate_gold(target_table=dim["target_table"], key_column=dim["key_column"])
+
+    write_audit_log(
+        run_id=RUN_ID, table_name=dim["target_table"], source_file_name=dim["source_table"],
+        run_timestamp=RUN_TIMESTAMP, rows_read=df.count(),
+        rows_inserted=write_metrics["rows_inserted"], rows_updated=write_metrics["rows_updated"],
+        rows_total=write_metrics["rows_total_after_write"], status="SUCCESS", error_message=None
+    )
+
+# =============================================================================
+# CODE CELL 10 (notebook cell index 10)
+# =============================================================================
+# =============================================================================
+# CELL 9 -- gold.fact_sales
+# =============================================================================
+# Purpose : The central fact table. Grain: one row per order line item
+#           (order_id, line_no).
+#
+# Join justification (each one earns its place, not "join everything"):
+#   - Order_Details is the base: quantity/unit_price/discount already live
+#     here, so extended_amount needs NO join, pure row-level calculation.
+#   - Orders: joined for order_date/customer_id/employee_id -- attributes
+#     that live on the parent order, needed as FKs/dates on the fact.
+#   - Shipments: joined for shipper_id + corrected shipment_date ONLY.
+#     Confirmed via EDA to share the exact same grain (order_id, line_no)
+#     as Order_Details 1:1 -- this is fact-to-fact consolidation of a
+#     single business event split across two source files, not a
+#     dimension join. Shipments' own customer_id/employee_id/product_id
+#     columns are intentionally ignored (redundant, avoid two sources of
+#     truth). LEFT JOIN to avoid silently dropping order lines if the 1:1
+#     grain match ever breaks in a future load.
+#   - dim_product: joined ONLY to bring unit_cost for the margin
+#     calculation -- pre-computed here (not left to Power BI DAX) since
+#     DAX measures like SUMX+RELATED scale poorly at this row volume;
+#     margin is materialized as a column instead.
+# =============================================================================
+
+def build_fact_sales():
+    df_details = spark.table("silver.fact_order_details")
+
+    df_orders = spark.table("silver.fact_orders").select(
+        col("order_id"),
+        col("order_date"),
+        col("customer_id"),
+        col("employee_id"),
+    )
+
+    df_shipments = spark.table("silver.fact_shipments").select(
+        col("order_id"),
+        col("line_no"),
+        col("shipper_id"),
+        col("shipment_date"),
+    )
+
+    df_product_cost = spark.table("gold.dim_product").select(
+        col("product_id"),
+        col("unit_cost"),
+    )
+
+    df_fact_sales = (
+        df_details
+        .join(df_orders, on="order_id", how="left")
+        .join(df_shipments, on=["order_id", "line_no"], how="left")
+        .join(df_product_cost, on="product_id", how="left")
+    )
+
+    df_fact_sales = df_fact_sales.withColumn(
+        "extended_amount",
+        F.round(col("quantity") * col("unit_price") * (F.lit(1) - col("discount")), 2)
+    ).withColumn(
+        "margin",
+        F.round(
+            (col("quantity") * col("unit_price") * (F.lit(1) - col("discount")))
+            - (col("quantity") * col("unit_cost")),
+            2
+        )
+    )
+
+    df_fact_sales = df_fact_sales.select(
+        col("order_id"),
+        col("line_no"),
+        col("order_date"),
+        col("shipment_date"),
+        col("customer_id"),
+        col("employee_id"),
+        col("product_id"),
+        col("shipper_id"),
+        col("quantity"),
+        col("unit_price"),
+        col("discount"),
+        col("extended_amount"),
+        col("margin"),
+    )
+
+    print(f"fact_sales rows: {df_fact_sales.count():,}")
+    return df_fact_sales
+
+
+df_fact_sales = build_fact_sales()
+display(df_fact_sales.limit(10))
+
+write_metrics = write_gold_merge(
+    df_transformed=df_fact_sales,
+    target_table="gold.fact_sales",
+    merge_key=["order_id", "line_no"]
+)
+
+validation = validate_gold(target_table="gold.fact_sales", key_column=["order_id", "line_no"])
+
+write_audit_log(
+    run_id=RUN_ID, table_name="gold.fact_sales",
+    source_file_name="silver.fact_order_details+silver.fact_orders+silver.fact_shipments+gold.dim_product",
+    run_timestamp=RUN_TIMESTAMP, rows_read=df_fact_sales.count(),
+    rows_inserted=write_metrics["rows_inserted"], rows_updated=write_metrics["rows_updated"],
+    rows_total=write_metrics["rows_total_after_write"], status="SUCCESS", error_message=None
+)
+
+# =============================================================================
+# CODE CELL 11 (notebook cell index 11)
+# =============================================================================
+df_sales = spark.table("gold.fact_sales")
+total_lines = df_sales.count()
+
+negative_margin = df_sales.filter(col("margin") < 0)
+neg_count = negative_margin.count()
+neg_total_loss = negative_margin.agg(F.sum("margin")).collect()[0][0]
+total_extended = df_sales.agg(F.sum("extended_amount")).collect()[0][0]
+total_margin = df_sales.agg(F.sum("margin")).collect()[0][0]
+
+print(f"{'='*70}")
+print(f"  NEGATIVE MARGIN FINDING -- Quantified for presentation")
+print(f"{'='*70}")
+print(f"  Total order lines           : {total_lines:,}")
+print(f"  Lines with NEGATIVE margin  : {neg_count:,} ({neg_count/total_lines*100:.1f}%)")
+print(f"  Total dollar loss on those  : ${neg_total_loss:,.2f}")
+print(f"  Total revenue (all lines)   : ${total_extended:,.2f}")
+print(f"  Total margin (all lines)    : ${total_margin:,.2f}")
+print(f"  Loss as % of total margin   : {abs(neg_total_loss)/total_margin*100:.1f}%")
+print(f"{'='*70}")
+
+print("\n-- Top 10 products driving the biggest losses --")
+display(
+    negative_margin
+    .groupBy("product_id")
+    .agg(
+        F.count("*").alias("loss_making_lines"),
+        F.sum("margin").alias("total_loss")
+    )
+    .join(spark.table("gold.dim_product").select("product_id","product_name"), "product_id")
+    .orderBy("total_loss")
+    .select("product_id","product_name","loss_making_lines","total_loss")
+    .limit(10)
+)
+
+print("\n-- Negative margin lines by discount level --")
+display(
+    negative_margin
+    .groupBy("discount")
+    .agg(F.count("*").alias("count"), F.sum("margin").alias("total_loss"))
+    .orderBy("discount")
+)
+
+# =============================================================================
+# CODE CELL 12 (notebook cell index 12)
+# =============================================================================
+# =============================================================================
+# CELL 10 -- gold.fact_budget
+# =============================================================================
+# Purpose : Conform silver.fact_budget into Gold. No transformations needed
+#           beyond the metadata simplification already applied to every
+#           other Gold table -- Silver already unpivoted the year columns
+#           and cast types correctly.
+# =============================================================================
+
+def build_fact_budget():
+    df = spark.table("silver.fact_budget")
+
+    # Same lean-metadata pattern as the rest of Gold: drop Silver's own
+    # created_at/updated_at/row_hash, keep only source_system, and let
+    # write_gold_merge() generate Gold's own created_at/updated_at.
+    cols_to_drop = [
+        "created_at", "updated_at", "row_hash",
+        "bronze_source_file_name", "bronze_created_at", "bronze_updated_at"
+    ]
+    df = df.drop(*[c for c in cols_to_drop if c in df.columns])
+    print(f"fact_budget rows: {df.count():,}")
+    return df
+
+
+df_fact_budget = build_fact_budget()
+display(df_fact_budget.limit(10))
+
+write_metrics = write_gold_merge(
+    df_transformed=df_fact_budget,
+    target_table="gold.fact_budget",
+    merge_key=["office", "employee_id", "year"]
+)
+
+validation = validate_gold(target_table="gold.fact_budget", key_column=["office", "employee_id", "year"])
+
+write_audit_log(
+    run_id=RUN_ID, table_name="gold.fact_budget", source_file_name="silver.fact_budget",
+    run_timestamp=RUN_TIMESTAMP, rows_read=df_fact_budget.count(),
+    rows_inserted=write_metrics["rows_inserted"], rows_updated=write_metrics["rows_updated"],
+    rows_total=write_metrics["rows_total_after_write"], status="SUCCESS", error_message=None
+)
+
+# =============================================================================
+# CODE CELL 13 (notebook cell index 13)
+# =============================================================================
+# =============================================================================
+# CELL 11 -- Final Gold validation summary
+# =============================================================================
+# Purpose : Recap all 9 Gold tables in one place -- row count, key nulls,
+#           duplicates. Final evidence that the Star Schema is clean and
+#           ready for BI consumption.
+# =============================================================================
+
+GOLD_TABLES = [
+    {"table": "gold.dim_date",     "key": "date_key"},
+    {"table": "gold.dim_customer", "key": "customer_id"},
+    {"table": "gold.dim_product",  "key": "product_id"},
+    {"table": "gold.dim_employee", "key": "emp_id"},
+    {"table": "gold.dim_supplier", "key": "supplier_id"},
+    {"table": "gold.dim_shipper",  "key": "shipper_id"},
+    {"table": "gold.dim_division", "key": "division_id"},
+    {"table": "gold.fact_sales",   "key": ["order_id", "line_no"]},
+    {"table": "gold.fact_budget",  "key": ["office", "employee_id", "year"]},
+]
+
+summary_rows = []
+
+for t in GOLD_TABLES:
+    key_cols = [t["key"]] if isinstance(t["key"], str) else t["key"]
+    df = spark.table(t["table"])
+
+    total = df.count()
+
+    null_condition = None
+    for k in key_cols:
+        cond = F.col(k).isNull()
+        null_condition = cond if null_condition is None else (null_condition | cond)
+    nulls = df.filter(null_condition).count()
+
+    dupes = df.groupBy(*key_cols).count().filter("count > 1").count()
+
+    summary_rows.append({
+        "table": t["table"],
+        "rows": total,
+        "key_nulls": nulls,
+        "duplicate_keys": dupes,
+        "status": "CLEAN" if (nulls == 0 and dupes == 0) else "REVIEW NEEDED"
+    })
+
+print(f"{'='*90}")
+print(f"  GOLD STAR SCHEMA -- FINAL VALIDATION SUMMARY")
+print(f"{'='*90}")
+print(f"  {'Table':<22} {'Rows':>10} {'Key Nulls':>10} {'Dup Keys':>10}  Status")
+print(f"  {'-'*22} {'-'*10} {'-'*10} {'-'*10}  {'-'*15}")
+for r in summary_rows:
+    print(f"  {r['table']:<22} {r['rows']:>10,} {r['key_nulls']:>10} {r['duplicate_keys']:>10}  {r['status']}")
+
+issues = sum(1 for r in summary_rows if r["status"] != "CLEAN")
+print(f"\n{'='*90}")
+if issues == 0:
+    print(f"  \u2705 All {len(summary_rows)} Gold tables are clean and ready for BI consumption.")
+else:
+    print(f"  \u26a0\ufe0f  {issues} table(s) need review -- see above.")
+print(f"{'='*90}")
